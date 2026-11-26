@@ -355,3 +355,5 @@ We thank [DeepSeek DeepEP](https://github.com/deepseek-ai/DeepEP) for the upstre
 ---
 
 Project material for which Lu Lu holds the relevant rights is licensed under the [BSD 2-Clause License](LICENSE). Other source material retains its own copyright notices and license texts.
+
+For training-oriented single-layer MoE overlap experiments, see the [MoE overlap benchmark](benchmarks/moe_overlap/README.md), with EP4 serial/overlap controls and baseline comparison. Offline checks do not establish device performance.

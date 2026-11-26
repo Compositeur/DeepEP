@@ -1,0 +1,18 @@
+{
+  "tokens": 4096,
+  "hidden": 2816,
+  "experts": 256,
+  "topk": 8,
+  "width": 768,
+  "shared_width": 768,
+  "ep": 4,
+  "api": "v1_global_clos",
+  "num_sms": 32,
+  "wgrad_backend": "gmm_add",
+  "seed": 20260823,
+  "warmup": 5,
+  "iterations": 30,
+  "repeats": 3,
+  "profile_iterations": 0,
+  "clamp": 0.0
+}

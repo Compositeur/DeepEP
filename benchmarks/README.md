@@ -67,3 +67,7 @@ hidden 值可被 BF16 精确表示；FP8 先生成 BF16，再按固定参考的�
 退出码 0 表示规划成功；当前请求 native 测量返回 2，错误为缺少 native benchmark adapter。参数、配置或输出路径错误也返回非零。结构化失败结果只记录错误类型，详细错误位于 stderr。
 
 `_config.py` 实现配置及字节计算，`_utils.py` 实现通用计时、统计和序列化，`_backend.py` 定义内部适配协议。可运行 `python -m pytest tests/test_benchmark.py -q` 检查这些协议；CPU 合成样本不作为性能数据发布。
+
+## MoE 通信与计算重叠
+
+[MoE overlap benchmark](moe_overlap/README.md) 提供 EP4 单层 MoE 的前向 dispatch × 共享专家、反向 combine × wgrad 串并行对照、CPU 数学检查与性能基线比较。四卡收益需另行实测，不能由离线测试推断。
