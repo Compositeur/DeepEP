@@ -1,7 +1,17 @@
-"""A/D switches change waits, never expert operands or arithmetic."""
+"""Independent A/C/D waits and five isolated communication/compute windows."""
 
 import torch
-from .model import Math, initialize, expert_forward, expert_dgrad, expert_wgrad, shared_forward, shared_backward
+from .model import (
+    Math,
+    initialize,
+    expert_forward,
+    expert_dgrad,
+    expert_wgrad,
+    shared_forward,
+    shared_backward,
+    attention_replay,
+)
+from .scenarios import WINDOWS, CONTROLS, modes_for_suite
 
 
 class Clock:
@@ -29,12 +39,15 @@ class Layer:
         self.g1 = torch.zeros_like(self.data["w1"], dtype=dtype)
         self.g2 = torch.zeros_like(self.data["w2"], dtype=dtype)
         self.last_d = None
+        self.last_f = None
+        self.last_c = None
+        self.attention_fixture = None
 
     def reset(self):
         self.g1.zero_()
         self.g2.zero_()
 
-    def step(self, overlap_a=False, overlap_d=False, timed=False):
+    def step(self, overlap_a=False, overlap_d=False, timed=False, *, overlap_c=False):
         p = self.data
         c = self.c
         adapter = self.adapter
@@ -62,13 +75,23 @@ class Layer:
         routed, done = adapter.combine(payload, ctx)
         adapter.wait(done)
         y = routed + ys
+        self.last_f = (payload, ctx, ys, routed)
+        mark("c_start")
         with torch.profiler.record_function("moe/backward_cached_dispatch"):
             dy, done = adapter.cached(p["dy"], ctx)
-            adapter.wait(done)
+            if not overlap_c:
+                adapter.wait(done)
+            dxshared, sg1, sg2 = shared_backward(p["dy"], p["sw1"], p["sw2"], sctx)
+            if c.recompute_experts:
+                _, ectx = expert_forward(self.math, x, p["w1"], p["w2"], counts, c.clamp)
+            if overlap_c:
+                adapter.wait(done)
+        mark("c_end")
+        self.last_c = (ctx, sctx, x, counts)
+        with torch.profiler.record_function("moe/pack_cached_gradient"):
             dy = adapter.pack_gradient(dy, ctx)
         with torch.profiler.record_function("moe/experts_dgrad"):
             dxpacked, wctx = expert_dgrad(self.math, dy, gates, p["w1t"], p["w2t"], counts, ectx)
-            dxshared, sg1, sg2 = shared_backward(p["dy"], p["sw1"], p["sw2"], sctx)
             payload = adapter.prepare_combine(dxpacked, ctx)
         # Capture only after aggregate/casts have produced the final communication input.
         mark("d_start")
@@ -86,46 +109,102 @@ class Layer:
         outputs = dict(Y=y, dX=dx, expert_dW1=self.g1, expert_dW2=self.g2, shared_dW1=sg1, shared_dW2=sg2)
         times = (
             clock.results(
-                [("total_us", "start", "end"), ("a_window_us", "a_start", "a_end"), ("d_window_us", "d_start", "d_end")]
+                [
+                    ("total_us", "start", "end"),
+                    ("a_window_us", "a_start", "a_end"),
+                    ("c_window_us", "c_start", "c_end"),
+                    ("d_window_us", "d_start", "d_end"),
+                ]
             )
             if clock
             else {}
         )
         return outputs, times
 
-    def window(self, case, control):
-        """D uses a real forward/backward-produced fixture prepared outside timing."""
-        if case not in ("A", "D") or control not in ("comm_only", "compute_only", "serial", "overlap"):
+    def prepare_windows(self, cases):
+        """Allocate attention proxy weights outside timed windows, only when needed."""
+        if "R" not in cases or self.attention_fixture is not None:
+            return
+        c = self.c
+        x = self.data["x"][: min(c.tokens, c.attention_tokens)]
+        generator = torch.Generator().manual_seed(c.seed + 50000)
+        width = c.attention_heads * c.attention_head_dim
+
+        def rand(shape):
+            return (torch.randn(shape, generator=generator) * 0.1).to(device=x.device, dtype=x.dtype)
+
+        self.attention_fixture = (x, rand((c.hidden, 3 * width)), rand((width, c.hidden)), c.attention_heads)
+
+    def window(self, case, control, *, timed=True):
+        """B is dependency constrained; R is an isolated, explicitly synthetic proxy."""
+        if case not in WINDOWS or control not in CONTROLS:
             raise ValueError("Unknown window/control")
+        if case == "R" and self.attention_fixture is None:
+            raise RuntimeError("Prepare R attention fixture before timing")
+        if case in ("B", "C", "D") and self.last_d is None:
+            raise RuntimeError("Prepare window fixtures with a complete step first")
         p = self.data
         adapter = self.adapter
-        clock = Clock()
-        clock.mark("start")
+        clock = Clock() if timed else None
+        if clock:
+            clock.mark("start")
         comm = control != "compute_only"
         compute = control != "comm_only"
-        if case == "A":
-            done = None
+        done = None
+        communication_output = compute_output = None
+        if case in ("A", "R"):
             if comm:
-                received, context, done = adapter.dispatch(p["x"], p["routes"], p["gates"])
+                communication_output, context, done = adapter.dispatch(p["x"], p["routes"], p["gates"])
             if control == "serial":
                 adapter.wait(done)
             if compute:
-                shared_forward(p["x"], p["sw1"], p["sw2"], self.c.clamp)
-        else:
-            if self.last_d is None:
-                raise RuntimeError("Prepare D fixture with a complete step first")
-            payload, ctx, wctx, counts = self.last_d
-            done = None
+                if case == "A":
+                    compute_output = shared_forward(p["x"], p["sw1"], p["sw2"], self.c.clamp)[0]
+                else:
+                    compute_output = attention_replay(*self.attention_fixture)
+        elif case == "B":
+            payload, ctx, ys, routed = self.last_f
             if comm:
-                _, done = adapter.combine(payload, ctx)
+                communication_output, done = adapter.combine(payload, ctx)
+            # The representative output-add consumes combine's result. Moving this
+            # wait would read an unfinished tensor, not create legal overlap.
+            if comm and (compute or control == "serial"):
+                adapter.wait(done)
+                done = None
+            if compute:
+                compute_output = (communication_output if comm else routed) + ys
+        elif case == "C":
+            ctx, sctx, expert_x, counts = self.last_c
+            if comm:
+                communication_output, done = adapter.cached(p["dy"], ctx)
+            if control == "serial":
+                adapter.wait(done)
+            if compute:
+                shared_grads = shared_backward(p["dy"], p["sw1"], p["sw2"], sctx)
+                recomputed, _ = expert_forward(self.math, expert_x, p["w1"], p["w2"], counts, self.c.clamp)
+                compute_output = (*shared_grads, recomputed)
+        elif case == "D":
+            payload, ctx, wctx, counts = self.last_d
+            if comm:
+                communication_output, done = adapter.combine(payload, ctx)
             if control == "serial":
                 adapter.wait(done)
             if compute:
                 expert_wgrad(self.math, wctx, counts, self.g1, self.g2)
-        if comm and control != "serial":
+                compute_output = (self.g1, self.g2)
+        if done is not None and control != "serial":
             adapter.wait(done)
-        clock.mark("end")
-        return clock.results([("window_us", "start", "end")])["window_us"]
+        if clock:
+            clock.mark("end")
+            return clock.results([("window_us", "start", "end")])["window_us"]
+        if comm and case in ("A", "R"):
+            # Fresh receive order is not a stable oracle. Validate an identity
+            # roundtrip outside timing instead of comparing transport row order.
+            packed, gates, _ = adapter.unpack(communication_output, context)
+            weighted = (packed.float() * gates[:, None]).to(packed.dtype) if self.npu else packed * gates[:, None]
+            communication_output, event = adapter.combine(adapter.prepare_combine(weighted, context), context)
+            adapter.wait(event)
+        return dict(communication_output=communication_output, compute_output=compute_output)
 
 
 def autograd_reference(data, limit=0):
@@ -152,7 +231,6 @@ def autograd_reference(data, limit=0):
 def cpu_check(c):
     from dataclasses import replace
     from .adapters import LocalReference
-    from .config import MODES
 
     # Small, independent float64 mathematical check, explicitly not an NPU result.
     small = replace(
@@ -160,6 +238,7 @@ def cpu_check(c):
         tokens=min(c.tokens, 5),
         hidden=min(c.hidden, 8),
         experts=4,
+        ep=4,
         topk=min(c.topk, 2),
         width=min(c.width, 4),
         shared_width=min(c.shared_width, 4),
@@ -169,9 +248,9 @@ def cpu_check(c):
     reference = autograd_reference(layer.data, small.clamp)
     checked = []
     with torch.no_grad():
-        for name, (a, d) in MODES.items():
+        for name, (a, cached, d) in modes_for_suite(c.layer_suite).items():
             layer.reset()
-            actual, _ = layer.step(a, d)
+            actual, _ = layer.step(a, d, overlap_c=cached)
             for key in reference:
                 torch.testing.assert_close(actual[key], reference[key], rtol=1e-10, atol=1e-12)
             checked.append(name)

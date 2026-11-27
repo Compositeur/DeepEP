@@ -345,4 +345,4 @@ buffer.destroy()
 
 Lu Lu 持有权利的项目内容采用 [BSD 2-Clause 许可证](LICENSE)。其他来源代码保留各自的版权声明和许可证文本。
 
-训练相关的单层 MoE 通信与计算重叠实验见 [MoE overlap benchmark](benchmarks/moe_overlap/README.md)，包含 EP4 串并行控制与基线比较。离线检查不代表设备性能验证。
+训练相关的单层 MoE 通信与计算重叠实验见 [MoE overlap benchmark](benchmarks/moe_overlap/README.md)，包含 EP4/EP16 五类窗口、A/C/D 开关、重叠时间线分析与基线比较。离线检查不代表设备性能验证。

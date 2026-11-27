@@ -9,7 +9,7 @@ import platform
 import subprocess
 import sys
 
-from .config import MODES
+from .scenarios import WINDOWS, CONTROLS, modes_for_suite, layer_scope
 
 
 def fingerprint():
@@ -126,7 +126,7 @@ def sampled_reference(layer, rank):
     return source
 
 
-def run(c, out, margin=0, windows=True, baseline=None, case="all"):
+def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=None):
     import datetime
     import torch
     import torch_npu
@@ -136,28 +136,36 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all"):
     from .metrics import summarize, regression
 
     c.validate()
+    mode_spec = modes_for_suite(c.layer_suite)
+    window_cases = list(WINDOWS) if case == "all" else [case] if case in WINDOWS else []
+    if not windows or case == "layer":
+        window_cases = []
     rank = int(os.environ.get("RANK", "-1"))
     local = int(os.environ.get("LOCAL_RANK", "-1"))
-    if int(os.environ.get("WORLD_SIZE", 0)) != 4 or min(rank, local) < 0:
-        raise ValueError("Use torchrun --nproc-per-node=4 with four visible devices")
+    local_world = int(os.environ.get("LOCAL_WORLD_SIZE", c.ep))
+    if int(os.environ.get("WORLD_SIZE", 0)) != c.ep or not 0 <= local < local_world or not 0 <= rank < c.ep:
+        raise ValueError("Use torchrun with WORLD_SIZE equal to configured EP and valid local rank")
     torch.set_num_threads(1)
     torch.npu.set_device(local)
-    if torch.npu.device_count() != 4 or not torch.npu.is_available():
-        raise RuntimeError("Exactly four visible, usable NPUs required")
+    if torch.npu.device_count() != local_world or not torch.npu.is_available():
+        raise RuntimeError("Visible NPUs must match LOCAL_WORLD_SIZE and be usable")
     dest = out / f"rank{rank}"
     dest.mkdir(parents=True, exist_ok=False)
     adapter = None
     initialized = False
     report = dict(
         rank=rank,
-        world_size=4,
+        world_size=c.ep,
         config=c.dictionary(),
         precision_passed=False,
         destroyed=False,
         trials=[],
         windows={},
         case=case,
-        scope="real_NPU_EP4_MoE_window_" + case if case in ("A", "D") else "real_NPU_EP4_single_MoE_layer_A_D",
+        scope=f"real_NPU_EP{c.ep}_MoE_window_" + case if case in WINDOWS else layer_scope(c.layer_suite, c.ep),
+        window_cases=window_cases,
+        reported_overlap_reference=reference,
+        scenarios={key: WINDOWS[key] for key in window_cases},
     )
 
     def save():
@@ -188,13 +196,22 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all"):
             torch.npu.synchronize()
             dist.barrier()
 
-        reference = None
+        def prepare_case(window_case):
+            # Refresh cached handles after other cases performed fresh dispatch.
+            # Fixture creation is excluded from every measured/profiler window.
+            prepare()
+            layer.step()
+            layer.prepare_windows([window_case])
+            torch.npu.synchronize()
+            dist.barrier()
+
+        precision_reference = None
         with torch.no_grad():
-            for mode, (a, d) in MODES.items():
+            for mode, (a, cached, d) in mode_spec.items():
                 prepare()
-                actual, _ = layer.step(a, d)
-                if reference is None:
-                    reference = {k: v.clone() for k, v in actual.items()}
+                actual, _ = layer.step(a, d, overlap_c=cached)
+                if precision_reference is None:
+                    precision_reference = {k: v.clone() for k, v in actual.items()}
                     for token, y, dx in source:
                         torch.testing.assert_close(actual["Y"][token].cpu().float(), y, rtol=0.06, atol=0.002)
                         torch.testing.assert_close(actual["dX"][token].cpu().float(), dx, rtol=0.06, atol=0.002)
@@ -212,77 +229,135 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all"):
                                     gold = gold.bfloat16().float()
                                 torch.testing.assert_close(target[e, :4, :4].cpu(), gold, rtol=0.04, atol=0.002)
                         offset += n
-                for key in reference:
+                for key in precision_reference:
                     torch.testing.assert_close(
-                        actual[key], reference[key], rtol=c.precision_rtol, atol=c.precision_atol
+                        actual[key], precision_reference[key], rtol=c.precision_rtol, atol=c.precision_atol
                     )
                     if not bool(torch.isfinite(actual[key]).all().item()):
                         raise RuntimeError("Nonfinite " + key)
-            del reference
+            del precision_reference
+            layer.prepare_windows(window_cases)
+            if "R" in window_cases:
+                report["attention_proxy"] = dict(
+                    tokens=min(c.tokens, c.attention_tokens),
+                    heads=c.attention_heads,
+                    head_dim=c.attention_head_dim,
+                    implementation="eager_causal_QKV_softmax_output_projection",
+                    matches_profile_MLA=False,
+                )
+            expected_y = actual["Y"].clone()
+
+            def snapshot(value):
+                if isinstance(value, torch.Tensor):
+                    return value.clone()
+                if isinstance(value, tuple):
+                    return tuple(snapshot(item) for item in value)
+                if isinstance(value, dict):
+                    return {key: snapshot(item) for key, item in value.items()}
+                return value
+
+            for window_case in window_cases:
+                prepare_case(window_case)
+                expected = None
+                for control in ("serial", "overlap"):
+                    prepare()
+                    checked = layer.window(window_case, control, timed=False)
+                    torch.npu.synchronize()
+                    if window_case in ("A", "R"):
+                        torch.testing.assert_close(
+                            checked["communication_output"],
+                            layer.data["x"],
+                            rtol=c.precision_rtol,
+                            atol=c.precision_atol,
+                        )
+                    if window_case == "B":
+                        torch.testing.assert_close(
+                            checked["compute_output"], expected_y, rtol=c.precision_rtol, atol=c.precision_atol
+                        )
+                    if expected is None:
+                        expected = snapshot(checked)
+                    torch.testing.assert_close(checked, expected, rtol=c.precision_rtol, atol=c.precision_atol)
+            report["window_precision_checked"] = window_cases
             report["precision_passed"] = True
             report["precision_scope"] = (
                 "independent tiny CPU autograd; sampled source Y/dX and local dW; all six outputs cross-mode; frozen gates"
             )
             save()
             for rep in range(c.repeats if case in ("all", "layer") else 0):
-                modes = list(MODES)
-                modes = modes[rep % 4 :] + modes[: rep % 4]
+                modes = list(mode_spec)
+                modes = modes[rep % len(modes) :] + modes[: rep % len(modes)]
                 if rep % 2:
                     modes.reverse()
                 for mode in modes:
-                    a, d = MODES[mode]
+                    a, cached, d = mode_spec[mode]
                     for _ in range(c.warmup):
                         prepare()
-                        layer.step(a, d, True)
+                        layer.step(a, d, True, overlap_c=cached)
                     samples = []
                     for _ in range(c.iterations):
                         prepare()
-                        _, timing = layer.step(a, d, True)
+                        _, timing = layer.step(a, d, True, overlap_c=cached)
                         samples.append(timing)
                     report["trials"].append(dict(mode=mode, repeat=rep, samples=samples))
                     save()
-            if windows and case != "layer":
-                # last_d comes from real forward/cached-dispatch/dgrad, not random matrices.
-                for window_case in ("D", "A") if case == "all" else (case,):
-                    report["windows"][window_case] = {}
-                    for control in ("comm_only", "compute_only", "serial", "overlap"):
-                        reps = []
-                        for rep in range(c.repeats):
-                            for _ in range(c.warmup):
-                                prepare()
-                                layer.window(window_case, control)
-                            values = []
-                            for _ in range(c.iterations):
-                                prepare()
+            for window_case in window_cases:
+                prepare_case(window_case)
+                report["windows"][window_case] = {control: [] for control in CONTROLS}
+                for rep in range(c.repeats):
+                    controls = list(CONTROLS)
+                    controls = controls[rep % 4 :] + controls[: rep % 4]
+                    if rep % 2:
+                        controls.reverse()
+                    for control in controls:
+                        for _ in range(c.warmup):
+                            prepare()
+                            layer.window(window_case, control)
+                        values = []
+                        for _ in range(c.iterations):
+                            prepare()
+                            with torch.profiler.record_function(f"moe/window/{window_case}/{control}"):
                                 values.append(layer.window(window_case, control))
-                            reps.append(values)
-                        report["windows"][window_case][control] = reps
+                        report["windows"][window_case][control].append(values)
                     save()
             if c.profile_iterations:
-                # Trace both serial and A+D after all performance samples, never mix samples.
-                for mode in ("serial", "overlap") if case in ("A", "D") else ("serial", "ad"):
-                    with torch_npu.profiler.profile(
-                        activities=[torch_npu.profiler.ProfilerActivity.CPU, torch_npu.profiler.ProfilerActivity.NPU],
-                        record_shapes=True,
-                        on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(str(dest / f"profile_{mode}")),
-                        experimental_config=torch_npu.profiler._ExperimentalConfig(
-                            profiler_level=torch_npu.profiler.ProfilerLevel.Level1
-                        ),
-                    ) as prof:
-                        for _ in range(c.profile_iterations):
-                            prepare()
-                            if case in ("A", "D"):
-                                with torch.profiler.record_function(f"moe/window/{case}/{mode}"):
-                                    layer.window(case, mode)
-                            else:
-                                layer.step(*MODES[mode], True)
-                            prof.step()
+                profile_cases = ["layer", *window_cases] if case == "all" else [case]
+                for profile_case in profile_cases:
+                    if profile_case in WINDOWS:
+                        prepare_case(profile_case)
+                    modes = (
+                        ("serial", "overlap")
+                        if profile_case in WINDOWS
+                        else ("serial", "acd" if c.layer_suite == "ACD" else "ad")
+                    )
+                    for mode in modes:
+                        with torch_npu.profiler.profile(
+                            activities=[
+                                torch_npu.profiler.ProfilerActivity.CPU,
+                                torch_npu.profiler.ProfilerActivity.NPU,
+                            ],
+                            record_shapes=True,
+                            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                                str(dest / f"profile_{profile_case}_{mode}")
+                            ),
+                            experimental_config=torch_npu.profiler._ExperimentalConfig(
+                                profiler_level=torch_npu.profiler.ProfilerLevel.Level1
+                            ),
+                        ) as prof:
+                            for _ in range(c.profile_iterations):
+                                prepare()
+                                if profile_case in WINDOWS:
+                                    with torch.profiler.record_function(f"moe/window/{profile_case}/{mode}"):
+                                        layer.window(profile_case, mode)
+                                else:
+                                    a, cached, d = mode_spec[mode]
+                                    layer.step(a, d, True, overlap_c=cached)
+                                prof.step()
         torch.npu.synchronize()
         dist.barrier()
         adapter.destroy()
         report["destroyed"] = True
         save()
-        gathered = [None] * 4
+        gathered = [None] * c.ep
         dist.all_gather_object(gathered, report)
         if rank == 0:
             result = summarize(gathered, margin)

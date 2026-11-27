@@ -1,8 +1,8 @@
 # MoE communication and compute overlap benchmark
 
-This benchmark compares two overlap points in one SwiGLU MoE layer using real
-DeepEP communication and explicit expert/shared-expert computation. It runs on one
-four-rank Global Clos group. It does not run a training framework or predict a
+This benchmark measures five scheduling windows around a SwiGLU MoE layer using
+real DeepEP communication and explicit expert/shared-expert computation. It runs
+on one four- or sixteen-rank Global Clos group. It does not run a training framework or predict a
 complete model's training speedup.
 
 ## Workload and controls
@@ -10,12 +10,27 @@ complete model's training speedup.
 | Window | Communication | Independent computation |
 | --- | --- | --- |
 | A | Forward dispatch | Shared-expert FC1, SwiGLU and FC2 |
+| B | Forward combine | Output add consuming the combine result (dependency control) |
+| R | Recompute dispatch | Eager attention replay on saved input (standalone proxy) |
+| C | Backward cached dispatch | Shared-expert backward and expert forward recomputation |
 | D | Backward combine of expert input gradients | Expert FC2 and FC1 weight gradients |
 
 Each isolated window has `comm_only`, `compute_only`, `serial` and `overlap`
-controls. A complete layer has `serial`, `a_only`, `d_only` and `ad` modes. These
+controls. B must wait before reading combine output even in the `overlap` control;
+its raw timing differences are not evidence of legal overlap. R uses Q/K/V
+projections, scaled QK matmul, causal FP32 softmax, value matmul and output projection.
+It is not a full gated MLA/Flash4 implementation or a full checkpoint engine.
+
+A complete layer defaults to `serial`, `a_only`, `d_only` and `ad`. Select
+`--layer-suite ACD` for eight modes: `serial`, `a_only`, `c_only`, `d_only`, `ac`,
+`ad`, `cd` and `acd`. These
 modes use the same tensors, weights, routes and arithmetic; only the completion
-wait moves across independent computation. DeepEP owns the communication stream;
+wait moves across independent computation. `recompute_experts=true` adds the same expert forward
+recomputation to every layer mode, using retained dispatched inputs, and feeds its
+activations into dgrad. It does not replay the R communication or reproduce activation
+offloading. C's isolated window always includes both shared backward and expert
+recomputation; the default legacy layer configuration does not enable the latter.
+DeepEP owns the communication stream;
 expert and shared-expert operations run on the caller's compute stream.
 
 A layer executes dispatch, shared and routed experts, forward combine, cached
@@ -24,13 +39,15 @@ expert weight gradients. The routed expert output enters forward combine; its
 computed input gradient enters backward combine. Shared output/gradients are
 included in the results. Routes are fixed per run, drawn without replacement per
 token, with equal FP32 gate weights. This is not a learned router or a captured
-recorded production token distribution.
+particular production token distribution.
 
 ## Requirements
 
 - Python 3.11+, Torch and matching `torch_npu`, CANN and driver versions compatible
   with the installed DeepEP build. Follow the repository [build guide](../../docs/build.md).
-- Exactly four visible, allocated NPUs in the same supported Global Clos EP group.
+- One allocated Global Clos EP4 or EP16 group, launched with `WORLD_SIZE=ep`.
+  Each node's visible NPU count must equal `LOCAL_WORLD_SIZE`. EP16 may require
+  a multi-node launch; use the repository's network/endpoint setup for that topology.
   The launcher never finds free devices or terminates other jobs.
 - V1 public `Buffer(machine_type="global_clos")` or V2 public `ElasticBuffer`.
   They use separate configurations and baselines. V2 uses expanded HT layout and
@@ -87,14 +104,24 @@ python -m torch.distributed.run --nnodes=1 --node-rank=0 \
   --module benchmarks.moe_overlap --execute --out smoke-v1
 ```
 
-Use `--case A` or `--case D` for one isolated window, `--case layer` for the four
-layer modes without isolated windows, or the default `--case all` for both.
-Correctness preparation still executes the layer for window-only runs so that D
-uses operands and handles produced by real dispatch and input-gradient computation.
+Use `--case A`, `B`, `R`, `C` or `D` for one isolated window, `--case layer` for
+layer modes without isolated windows, or the default `--case all` for all five
+windows plus the selected layer suite.
+Correctness preparation still executes the layer for window-only runs so that
+B/C/D use real operands and handles. Isolated serial/overlap outputs are also checked;
+A/R use an extra identity roundtrip only outside timing, avoiding comparisons of
+unstable receive row order. Attention proxy weights are allocated before timing. Fixtures and cached handles
+are refreshed outside timing between cases, after fresh-dispatch windows.
 
 `configs/smoke_v1.json` and `smoke_v2.json` have small inputs and two repetitions
 with two samples each. They test execution, not stable performance.
-`configs/example_v1.json` supplies a larger illustrative workload. Neither preset
+`configs/example_v1.json` supplies a larger illustrative workload.
+`configs/example_ep16_v2.json` enables EP16, 8192 tokens per rank, H=2816, E=256,
+K=8, expert/shared width 768, clamp 10, expert recomputation and the ACD suite.
+This defines reference workload dimensions. The preset does not model a full PP
+schedule, allocation/offloading, MLA, detailed routing load or per-kernel 32/48/64
+communication controls. It is a candidate to validate, not a calibrated reproduction.
+Neither preset
 is proof of hardware support or measured benefit. Increase warmup, iterations and
 repeats in a configuration copy after verifying correctness and memory requirements.
 No communication-kernel count control is claimed for V2 (`num_sms=0`).
@@ -112,15 +139,16 @@ aggregation.
 
 NPU events measure A/D windows and the layer from forward dispatch through the
 final gradient join. Synchronization, rank barriers and gradient zeroing precede
-each timed sample. Layer modes rotate order between repetitions; isolated controls
-currently run in a fixed order. Reports take the slowest rank for each sample,
+each timed sample. Layer modes and isolated controls rotate order between repetitions. Reports take the slowest rank for each sample,
 then compute independent repetition means. Benefit is the serial-to-overlap
 percentage reduction with a conservative 95% t interval. `inconclusive` is a valid
 result; the benchmark does not require or manufacture positive speedup. Small
 sample counts, thermal drift or device contention can invalidate conclusions.
 
 Set `profile_iterations` to a positive value for separate serial/overlap traces
-collected after all performance samples. Trace-enabled time is not used for
+collected after all performance samples. `--case all` records layer serial/combined
+modes and serial/overlap for each isolated window under separate `profile_CASE_MODE`
+directories. Trace-enabled time is not used for
 performance comparisons. Actual simultaneous kernel execution must be established
 from device traces, not from moving a wait in Python.
 
@@ -150,7 +178,8 @@ codes; none imply that a performance baseline was established.
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest \
   tests/test_moe_overlap.py tests/test_moe_overlap_environment.py \
-  tests/test_moe_overlap_cli.py -q
+  tests/test_moe_overlap_cli.py tests/test_moe_overlap_windows.py \
+  tests/test_moe_overlap_trace.py -q
 python -m benchmarks.moe_overlap --cpu-check --out cpu-math
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch.distributed.run \
   --nnodes=1 --node-rank=0 --master-addr=127.0.0.1 --master-port=29572 \
@@ -159,11 +188,13 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torch.distributed.run \
 ```
 
 The four CPU/Gloo processes check EP partitioning and gradients against autograd,
-including duplicate routing, imbalance and an empty expert. They do not call
+including duplicate routing, imbalance and an empty expert. Add `--layer-suite ACD
+--recompute-experts` to that CPU launch to check all eight modes with recomputation. They do not call
 DeepEP or measure NPU performance. CPU reports explicitly disable performance claims.
-The framework does not cover router parameter gradients, attention, checkpoint
+The framework does not cover router parameter gradients, full MLA attention, complete checkpoint
 recomputation, pipeline/data parallel scheduling, optimizer steps, EP8, LL or
-complete-model acceptance. The optional pointer backend and four-NPU paths need
+complete-model acceptance. R is isolated, and expert recomputation uses retained inputs;
+full checkpoint dispatch and offload scheduling remain outside layer acceptance. The optional pointer backend and multi-NPU paths need
 separate device validation; offline tests cannot establish speedup.
 
 The backward scheduling arrangement was informed by the
@@ -172,3 +203,80 @@ at reference commit `b2ed69b11e3a994cb13dab9aee9ec8e4593e366f`.
 The public V1 integration also follows
 [MegatronAdaptor PR 217](https://gitcode.com/Ascend/MegatronAdaptor/pull/217).
 Those references do not establish measured training gains.
+
+## Reference overlap values
+
+`configs/reported_overlap.json` provides the following reference values, not acceptance
+thresholds. Their denominator is **communication duration**: intersect
+communication and computation within the same fused-layer invocation, then sum
+intersection and communication durations over selected calls/ranks before dividing.
+Full communication is counted; payload-only ratios are a different metric.
+
+| Case | Reference temporal overlap |
+| --- | ---: |
+| A | 18.35% |
+| B | 0.00% |
+| R | 80.00% |
+| C | 99.69% |
+| D | 82.19% |
+
+The C reference combines shared-expert backward (66.987%) and expert forward
+recomputation (32.706%), totaling 99.693% before rounding. A shared-backward-only
+workload is a different reference case. R covers attention recomputation during backward,
+not attention backward. The reference configuration is EP16, MBS=2, GBS=256, PP=2,
+TP=CP=1, sequence length 4096; the reference records these dimensions. Equal gates,
+random routes and eager attention define a standalone approximation.
+
+```bash
+python -m benchmarks.moe_overlap --layer-suite ACD \
+  --reference-overlap benchmarks/moe_overlap/configs/reported_overlap.json
+```
+
+A reference annotates reports; it never changes computation size, inserts sleeps,
+sets measured timings or demands a target speedup. EP4 measurements are marked as
+a workload mismatch against the EP16 reference configuration. Percentages alone provide no
+kernel durations, critical path or training-step savings. A high overlap ratio may
+coexist with slower communication/compute under contention. Measure window/layer
+latency separately and re-establish baselines after this benchmark revision.
+
+## Measure device temporal overlap
+
+Use a reviewed device PID/category and kernel selectors for one rank, one layer
+invocation and one narrow window. Names alone do not establish phase attribution.
+Ascend trace device categories may be absent (treated as the empty string); never select host ranges
+as device work. Inspect the actual trace before replacing these placeholders:
+
+```bash
+python -m benchmarks.moe_overlap.trace --trace /path/to/trace_view.json \
+  --case C --rank 0 --device-pid DEVICE_PID --category '' \
+  --start-us WINDOW_START --end-us WINDOW_END \
+  --comm 'REVIEWED_COMM_KERNEL_REGEX' --compute 'REVIEWED_COMPUTE_KERNEL_REGEX' \
+  --reference-overlap benchmarks/moe_overlap/configs/reported_overlap.json \
+  --out trace-c-rank0-call1
+```
+
+The incremental reader accepts Chrome event arrays or `traceEvents` objects.
+Within each selected device process it clips intervals, unions repeated/overlapping
+kernels and intersects the communication and computation unions. Ambiguous
+selectors, missing work and invalid intervals fail. Reports separately provide
+communication coverage, computation coverage, overlap/window time and exposed
+communication microseconds. `performance_benefit` is null: temporal intersection
+is not a measurement of speedup. Neither trace analysis nor replay automatically
+classifies original training phases or guarantees matching workload conditions.
+
+Aggregate reviewed per-call reports of the **same case and kernel selectors**:
+
+```bash
+python -m benchmarks.moe_overlap.trace --aggregate \
+  benchmark-runs/moe-overlap/trace-c-rank0-call1/temporal_overlap.json \
+  benchmark-runs/moe-overlap/trace-c-rank8-call1/temporal_overlap.json \
+  --reference-overlap benchmarks/moe_overlap/configs/reported_overlap.json \
+  --out trace-c-weighted
+```
+
+This computes `sum(overlap_us) / sum(communication_us)`, not the mean of rank
+percentages, and rejects duplicate rank/window reports. It never intersects clocks
+from different ranks; summed durations are accounting totals, not elapsed step
+time. A numeric difference from the supplied reference is a diagnostic, not an
+acceptance or speedup verdict. If a different reference's denominator is unknown,
+set `ratio_definition` to `unspecified`; no numerical comparison is made.

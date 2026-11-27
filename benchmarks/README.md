@@ -70,4 +70,4 @@ hidden 值可被 BF16 精确表示；FP8 先生成 BF16，再按固定参考的�
 
 ## MoE 通信与计算重叠
 
-[MoE overlap benchmark](moe_overlap/README.md) 提供 EP4 单层 MoE 的前向 dispatch × 共享专家、反向 combine × wgrad 串并行对照、CPU 数学检查与性能基线比较。四卡收益需另行实测，不能由离线测试推断。
+[MoE overlap benchmark](moe_overlap/README.md) 提供 EP4/EP16 单层 MoE 的五类通信计算窗口、A/C/D 串并行开关、CPU 数学检查、设备重叠率分析与性能基线比较。设备收益需另行实测，不能由离线测试推断。

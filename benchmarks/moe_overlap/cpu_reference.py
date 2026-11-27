@@ -12,7 +12,8 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from benchmarks.moe_overlap.adapters import Context
-from benchmarks.moe_overlap.config import Config, MODES
+from benchmarks.moe_overlap.config import Config
+from benchmarks.moe_overlap.scenarios import modes_for_suite
 from benchmarks.moe_overlap.layer import Layer, autograd_reference
 from benchmarks.moe_overlap.model import initialize
 
@@ -62,6 +63,8 @@ class GlooReference:
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--layer-suite", choices=["AD", "ACD"], default="AD")
+    p.add_argument("--recompute-experts", action="store_true")
     a = p.parse_args()
     torch.set_num_threads(1)
     dist.init_process_group("gloo", timeout=datetime.timedelta(seconds=60))
@@ -69,7 +72,16 @@ def main():
     if dist.get_world_size() != 4:
         raise ValueError("Four CPU ranks required")
     try:
-        c = Config(tokens=3, hidden=4, experts=8, topk=2, width=3, shared_width=3)
+        c = Config(
+            tokens=3,
+            hidden=4,
+            experts=8,
+            topk=2,
+            width=3,
+            shared_width=3,
+            layer_suite=a.layer_suite,
+            recompute_experts=a.recompute_experts,
+        )
         data = []
         for r in range(4):
             d = initialize(c, r, "cpu", torch.float64, all_experts=True)
@@ -96,9 +108,9 @@ def main():
         source["expert_dW2"] = global_gold["expert_dW2"][rank * g : (rank + 1) * g]
         checked = []
         with torch.no_grad():
-            for mode, (overlap_a, overlap_d) in MODES.items():
+            for mode, (overlap_a, overlap_c, overlap_d) in modes_for_suite(c.layer_suite).items():
                 layer.reset()
-                actual, _ = layer.step(overlap_a, overlap_d)
+                actual, _ = layer.step(overlap_a, overlap_d, overlap_c=overlap_c)
                 for key in source:
                     torch.testing.assert_close(actual[key], source[key], rtol=1e-10, atol=1e-12)
                 checked.append(mode)
@@ -118,7 +130,10 @@ def main():
         )
         dist.barrier()
         if rank == 0:
-            print("CPU_GLOO_EP4_MATH_PASSED: 4 ranks, 4 modes, all six outputs; no NPU performance claim", flush=True)
+            print(
+                "CPU_GLOO_EP4_MATH_PASSED: 4 ranks, selected modes, all six outputs; no NPU performance claim",
+                flush=True,
+            )
     finally:
         dist.destroy_process_group()
 

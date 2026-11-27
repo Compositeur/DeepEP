@@ -3,6 +3,9 @@
 import math
 import statistics as st
 
+from .scenarios import WINDOWS, CONTROLS, modes_for_suite, layer_metrics, layer_scope
+from .reference import comparison
+
 
 def stats(values):
     if not values or any(not math.isfinite(v) or v <= 0 for v in values):
@@ -64,11 +67,41 @@ def paired(baseline, candidate, margin=0):
     )
 
 
+def window_summary(reports, case, cfg, margin, reference):
+    controls = {}
+    for control in CONTROLS:
+        repetitions = [r["windows"][case][control] for r in reports]
+        if any(len(reps) != cfg["repeats"] for reps in repetitions):
+            raise ValueError("Wrong window repetition count")
+        means, values = [], []
+        for rep in range(cfg["repeats"]):
+            arrays = [reps[rep] for reps in repetitions]
+            if any(len(a) != cfg["iterations"] for a in arrays):
+                raise ValueError("Wrong window sample count")
+            samples = [max(a[i] for a in arrays) for i in range(cfg["iterations"])]
+            stats(samples)
+            values.extend(samples)
+            means.append(st.mean(samples))
+        controls[control] = dict(**stats(values), repeat_means=means)
+    return dict(
+        controls=controls,
+        overlap_benefit=paired(controls["serial"]["repeat_means"], controls["overlap"]["repeat_means"], margin),
+        benefit_kind="measured_window_time_reduction_not_temporal_overlap",
+        temporal_overlap=dict(status="requires_device_trace", derived_from_timings=False),
+        scenario=WINDOWS[case],
+        reported_reference=comparison(reference, case, configuration=cfg),
+    )
+
+
 def summarize(reports, margin=0):
-    if len(reports) != 4 or {r["rank"] for r in reports} != {0, 1, 2, 3}:
-        raise ValueError("Exactly four rank reports required")
+    if not reports:
+        raise ValueError("Rank reports are required")
     first = reports[0]
     cfg = first["config"]
+    ep = cfg["ep"]
+    if ep not in (4, 16) or len(reports) != ep or {r["rank"] for r in reports} != set(range(ep)):
+        raise ValueError("Exactly the configured EP group's rank reports are required")
+    reference = first.get("reported_overlap_reference")
     for r in reports:
         if r["config"] != cfg or not r["precision_passed"] or not r["destroyed"]:
             raise ValueError("Configuration/precision/lifecycle mismatch")
@@ -77,109 +110,78 @@ def summarize(reports, margin=0):
                 raise ValueError("Rank implementation mismatch: " + key)
         if r.get("case", "all") != first.get("case", "all"):
             raise ValueError("Rank case mismatch")
-    if first.get("case") in ("A", "D"):
-        case = first["case"]
-        controls = {}
-        for control in ("comm_only", "compute_only", "serial", "overlap"):
-            reps = []
-            values = []
-            for rep in range(cfg["repeats"]):
-                arrays = [r["windows"][case][control][rep] for r in reports]
-                if any(len(a) != cfg["iterations"] for a in arrays):
-                    raise ValueError("Wrong window sample count")
-                v = [max(a[i] for a in arrays) for i in range(cfg["iterations"])]
-                stats(v)
-                values.extend(v)
-                reps.append(st.mean(v))
-            controls[control] = dict(**stats(values), repeat_means=reps)
-        return dict(
-            scope="real_NPU_EP4_MoE_window_" + case,
-            config=cfg,
-            precision_passed=True,
-            environment=first["environment"],
-            rank_environments=[r["environment"] for r in reports],
-            window_summary={
-                case: dict(
-                    controls=controls,
-                    overlap_benefit=paired(
-                        controls["serial"]["repeat_means"], controls["overlap"]["repeat_means"], margin
-                    ),
-                )
-            },
-            units="us",
-            method="per-sample slowest rank; independent repeat means",
-        )
-    expected = {(m, rep) for m in ("serial", "d_only", "a_only", "ad") for rep in range(cfg["repeats"])}
-    maps = []
-    for r in reports:
-        ix = {(t["mode"], t["repeat"]): t for t in r["trials"]}
-        if set(ix) != expected or len(ix) != len(r["trials"]):
-            raise ValueError("Missing/duplicate mode/repeat")
-        if any(len(t["samples"]) != cfg["iterations"] for t in ix.values()):
-            raise ValueError("Wrong sample count")
-        maps.append(ix)
-    rows = {}
-    means = {}
-    for mode in ("serial", "d_only", "a_only", "ad"):
-        rows[mode] = {}
-        means[mode] = {}
-        for metric in ("a_window_us", "d_window_us", "total_us"):
-            reps = []
-            all_samples = []
-            for rep in range(cfg["repeats"]):
-                values = [max(ix[(mode, rep)]["samples"][i][metric] for ix in maps) for i in range(cfg["iterations"])]
-                stats(values)
-                reps.append(st.mean(values))
-                all_samples.extend(values)
-            rows[mode][metric] = dict(**stats(all_samples), repeat_means=reps)
-            means[mode][metric] = reps
-    comparisons = {}
-    for mode in ("d_only", "a_only", "ad"):
-        comparisons[mode] = {
-            metric: paired(means["serial"][metric], means[mode][metric], margin) for metric in means[mode]
-        }
-    windows = {}
-    present = [bool(r["windows"]) for r in reports]
-    if any(present) and not all(present):
-        raise ValueError("Incomplete window reports")
-    if all(present):
-        for case in ("A", "D"):
-            rows_w = {}
-            for control in ("comm_only", "compute_only", "serial", "overlap"):
-                reps = []
-                values = []
-                for rep in range(cfg["repeats"]):
-                    arrays = [r["windows"][case][control][rep] for r in reports]
-                    if any(len(a) != cfg["iterations"] for a in arrays):
-                        raise ValueError("Wrong window sample count")
-                    v = [max(a[i] for a in arrays) for i in range(cfg["iterations"])]
-                    stats(v)
-                    values.extend(v)
-                    reps.append(st.mean(v))
-                rows_w[control] = dict(**stats(values), repeat_means=reps)
-            windows[case] = dict(
-                controls=rows_w,
-                overlap_benefit=paired(rows_w["serial"]["repeat_means"], rows_w["overlap"]["repeat_means"], margin),
-            )
-    return dict(
-        scope="real_NPU_EP4_single_MoE_layer_A_D",
+        if r.get("reported_overlap_reference") != reference:
+            raise ValueError("Rank reference mismatch")
+    common = dict(
         config=cfg,
-        method="max over ranks for each sample; CI uses independent repeat means",
-        units="us",
-        modes=rows,
-        overlap_benefit=comparisons,
         precision_passed=True,
         environment=first["environment"],
         rank_environments=[r["environment"] for r in reports],
-        window_summary=windows,
-        windows={str(r["rank"]): r["windows"] for r in reports},
+        units="us",
+        method="per-sample slowest rank; CI uses independent repeat means",
+        reported_overlap_reference=reference,
+    )
+    if first.get("case") in WINDOWS:
+        case = first["case"]
+        return dict(
+            scope=f"real_NPU_EP{ep}_MoE_window_" + case,
+            **common,
+            window_summary={case: window_summary(reports, case, cfg, margin, reference)},
+        )
+    suite = cfg.get("layer_suite", "AD")
+    modes = modes_for_suite(suite)
+    expected = {(mode, rep) for mode in modes for rep in range(cfg["repeats"])}
+    maps = []
+    for r in reports:
+        indexed = {(t["mode"], t["repeat"]): t for t in r["trials"]}
+        if set(indexed) != expected or len(indexed) != len(r["trials"]):
+            raise ValueError("Missing/duplicate mode/repeat")
+        if any(len(t["samples"]) != cfg["iterations"] for t in indexed.values()):
+            raise ValueError("Wrong sample count")
+        maps.append(indexed)
+    rows = {}
+    for mode in modes:
+        rows[mode] = {}
+        for metric in layer_metrics(suite):
+            means, values = [], []
+            for rep in range(cfg["repeats"]):
+                samples = [max(ix[(mode, rep)]["samples"][i][metric] for ix in maps) for i in range(cfg["iterations"])]
+                stats(samples)
+                means.append(st.mean(samples))
+                values.extend(samples)
+            rows[mode][metric] = dict(**stats(values), repeat_means=means)
+    benefits = {
+        mode: {
+            metric: paired(rows["serial"][metric]["repeat_means"], rows[mode][metric]["repeat_means"], margin)
+            for metric in layer_metrics(suite)
+        }
+        for mode in modes
+        if mode != "serial"
+    }
+    cases = set(first["windows"])
+    if not cases <= set(WINDOWS):
+        raise ValueError("Unknown window report")
+    for r in reports:
+        if set(r["windows"]) != cases or set(r.get("window_cases", cases)) != cases:
+            raise ValueError("Incomplete window reports")
+    return dict(
+        scope=layer_scope(suite, ep),
+        **common,
+        modes=rows,
+        overlap_benefit=benefits,
+        benefit_kind="measured_layer_or_window_time_reduction_not_temporal_overlap",
+        window_summary={
+            case: window_summary(reports, case, cfg, margin, reference) for case in WINDOWS if case in cases
+        },
     )
 
 
 def regression(baseline, candidate, margin=0):
     if margin < 0 or not math.isfinite(margin):
         raise ValueError("Invalid regression margin")
-    required_scope = "real_NPU_EP4_single_MoE_layer_A_D"
+    required_scope = layer_scope(
+        baseline.get("config", {}).get("layer_suite", "AD"), baseline.get("config", {}).get("ep", 4)
+    )
     if baseline.get("scope") != required_scope or candidate.get("scope") != required_scope:
         return dict(status="invalid", reason="Only real NPU layer reports may establish performance baselines")
     # Sample counts may grow; workload, API/backend, hardware and framework must match.
@@ -205,9 +207,9 @@ def regression(baseline, candidate, margin=0):
     if not baseline.get("precision_passed") or not candidate.get("precision_passed"):
         return dict(status="invalid", reason="Correctness did not pass")
     result = {}
-    for mode in ("serial", "d_only", "a_only", "ad"):
+    for mode in modes_for_suite(baseline["config"].get("layer_suite", "AD")):
         result[mode] = {}
-        for metric in ("total_us", "a_window_us", "d_window_us"):
+        for metric in layer_metrics(baseline["config"].get("layer_suite", "AD")):
             a = baseline["modes"][mode][metric]["repeat_means"]
             b = candidate["modes"][mode][metric]["repeat_means"]
             stats(a)

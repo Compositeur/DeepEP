@@ -101,6 +101,19 @@ def shared_backward(dy, w1, w2, ctx):
     return dx, g1, g2
 
 
+def attention_replay(x, qkv_weight, out_weight, heads):
+    """Eager causal attention on saved input, used only by isolated R replay."""
+    tokens = x.shape[0]
+    q, k, v = (x @ qkv_weight).chunk(3, dim=-1)
+    head_dim = q.shape[-1] // heads
+    q, k, v = [part.reshape(tokens, heads, head_dim).transpose(0, 1) for part in (q, k, v)]
+    scores = (q @ k.transpose(-1, -2)) * head_dim**-0.5
+    causal = torch.ones((tokens, tokens), dtype=torch.bool, device=x.device).triu(1)
+    probabilities = scores.float().masked_fill(causal, float("-inf")).softmax(dim=-1).to(x.dtype)
+    context = (probabilities @ v).transpose(0, 1).reshape(tokens, heads * head_dim)
+    return context @ out_weight
+
+
 def initialize(c, rank, device, dtype, all_experts=False):
     """Global expert seeds let the source oracle reconstruct remote weights."""
 

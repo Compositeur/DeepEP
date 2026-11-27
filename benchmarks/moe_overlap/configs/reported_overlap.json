@@ -1,0 +1,29 @@
+{
+  "ratio_definition": "communication_time",
+  "cases": {
+    "A": 18.35,
+    "B": 0.0,
+    "R": 80.0,
+    "C": 99.69,
+    "D": 82.19
+  },
+  "aggregation": "communication_duration_weighted_per_layer_call_across_ranks",
+  "context": {
+    "ep": 16,
+    "tokens": 8192,
+    "hidden": 2816,
+    "experts": 256,
+    "topk": 8,
+    "width": 768,
+    "shared_width": 768,
+    "clamp": 10.0,
+    "micro_batch_size": 2,
+    "global_batch_size": 256,
+    "pipeline_parallel_size": 2,
+    "tensor_parallel_size": 1,
+    "context_parallel_size": 1,
+    "sequence_length": 4096,
+    "communication_scope": "full_attributed_communication_not_payload_only",
+    "attention": "gated_MLA_flash4"
+  }
+}

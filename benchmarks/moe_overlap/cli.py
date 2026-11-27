@@ -1,19 +1,20 @@
-"""Plan, validate, execute and compare a four-rank MoE overlap benchmark."""
+"""Plan, validate, execute and compare an EP4/EP16 MoE overlap benchmark."""
 
 import argparse
-from dataclasses import fields
+from dataclasses import fields, replace
 import json
 import os
 from pathlib import Path
 import sys
 
 from .config import Config, plan
+from .scenarios import WINDOWS
 
 CONFIG_DIR = Path(__file__).parent / "configs"
 DEFAULT_WORKSPACE = Path(__file__).resolve().parents[2] / "benchmark-runs" / "moe-overlap"
 
 
-def load_config(path):
+def load_json(path):
     """Reject ambiguous or misspelled configuration before loading Torch."""
 
     def unique_keys(pairs):
@@ -29,6 +30,11 @@ def load_config(path):
     raw = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_keys)
     if not isinstance(raw, dict):
         raise ValueError("Configuration must be a JSON object")
+    return raw
+
+
+def load_config(path):
+    raw = load_json(path)
     unknown = set(raw) - {field.name for field in fields(Config)}
     if unknown:
         raise ValueError("Unknown configuration fields: " + ", ".join(sorted(unknown)))
@@ -67,7 +73,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=CONFIG_DIR / "smoke_v1.json")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--execute", action="store_true", help="Execute on four explicitly allocated NPUs")
+    mode.add_argument("--execute", action="store_true", help="Execute on an explicitly allocated EP4/EP16 NPU group")
     mode.add_argument("--cpu-check", action="store_true", help="Check small float64 math against autograd")
     mode.add_argument("--check-env", action="store_true", help="Check software imports and signatures only")
     mode.add_argument("--compare", nargs=2, type=Path, metavar=("BASELINE", "CANDIDATE"))
@@ -75,20 +81,30 @@ def main(argv=None):
     parser.add_argument("--out", type=Path, help="New result directory, relative to --workspace or absolute within it")
     parser.add_argument("--margin-percent", type=float, default=0)
     parser.add_argument("--skip-windows", action="store_true")
-    parser.add_argument("--case", choices=["D", "A", "layer", "all"], default="all")
+    parser.add_argument("--case", choices=[*WINDOWS, "layer", "all"], default="all")
+    parser.add_argument("--layer-suite", choices=["AD", "ACD"], help="Four legacy modes or eight A/C/D combinations")
+    parser.add_argument(
+        "--reference-overlap", type=Path, help="Reported observations; never used to tune work or timings"
+    )
     args = parser.parse_args(argv)
     if not 0 <= args.margin_percent < 100:
         parser.error("margin must be in [0, 100)")
-    if args.skip_windows and args.case in ("A", "D"):
+    if args.skip_windows and args.case in WINDOWS:
         parser.error("Selected window cannot be skipped")
     try:
         config = None if args.compare else load_config(args.config)
+        if config is not None and args.layer_suite:
+            config = replace(config, layer_suite=args.layer_suite).validate()
+        from .reference import load_reference
+
+        reference = load_reference(args.reference_overlap) if args.reference_overlap else None
         workspace = args.workspace.resolve()
         active = args.execute or args.cpu_check or args.compare or args.check_env
         if not active:
             result = plan(config)
             result["selected_case"] = args.case
             result["isolated_windows_enabled"] = not args.skip_windows and args.case != "layer"
+            result["reported_overlap_reference"] = reference
             print(json.dumps(result, indent=2))
             return
         if args.out is None and not args.check_env:
@@ -113,7 +129,7 @@ def main(argv=None):
     elif args.execute:
         from .runner import run
 
-        run(config, out, args.margin_percent, not args.skip_windows, case=args.case)
+        run(config, out, args.margin_percent, not args.skip_windows, case=args.case, reference=reference)
     else:
         from .metrics import regression
 
