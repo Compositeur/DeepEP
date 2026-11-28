@@ -260,15 +260,18 @@ class RealDataflowTests(unittest.TestCase):
                 return Event()
 
             def get_dispatch_layout(self, *a, **kw):
+                assert kw["allocate_on_comm_stream"] is True
                 return None, None, None, None, Event()
 
             def dispatch(self, x, **kw):
+                assert kw["allocate_on_comm_stream"] is True
                 calls.append(kw)
                 if "handle" in kw:
                     return x, None, None, None, None, Event()
                 return x, kw["topk_idx"], kw["topk_weights"], [2, 2], object(), Event()
 
             def combine(self, x, handle, **kw):
+                assert kw["allocate_on_comm_stream"] is True
                 calls.append(kw)
                 return x, None, Event()
 
@@ -309,6 +312,8 @@ class RealDataflowTests(unittest.TestCase):
                 return Event()
 
             def dispatch(self, x, handle=None, **kw):
+                assert kw["allocate_on_comm_stream"] is True
+                assert kw["do_expand"] is True
                 if handle is not None:
                     self.test_cached = kw
                     return x[handle.rows], None, None, handle, Event()
@@ -321,6 +326,7 @@ class RealDataflowTests(unittest.TestCase):
                 return x[rows], None, kw["topk_weights"][rows, slots], h, Event()
 
             def combine(self, x, handle, **kw):
+                assert kw["allocate_on_comm_stream"] is True
                 y = torch.zeros((2, 4), dtype=x.dtype)
                 y.index_add_(0, handle.rows, x)
                 return y, None, Event()

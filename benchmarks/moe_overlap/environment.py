@@ -75,9 +75,10 @@ def probe(c):
                 if c.api == "v1_global_clos"
                 else {"previous_event", "async_with_compute_stream", "do_expand", "do_cpu_sync"}
             )
-            checks["dispatch_contract"] = needed <= set(dispatch)
+            checks["dispatch_contract"] = (needed | {"allocate_on_comm_stream"}) <= set(dispatch)
             checks["combine_contract"] = {
                 "previous_event",
+                "allocate_on_comm_stream",
                 "async_finish" if c.api == "v1_global_clos" else "async_with_compute_stream",
             } <= set(combine)
         except Exception as exc:

@@ -121,8 +121,13 @@ K=8, expert/shared width 768, clamp 10, expert recomputation and the ACD suite.
 This defines reference workload dimensions. The preset does not model a full PP
 schedule, allocation/offloading, MLA, detailed routing load or per-kernel 32/48/64
 communication controls. It is a candidate to validate, not a calibrated reproduction.
-Neither preset
-is proof of hardware support or measured benefit. Increase warmup, iterations and
+`configs/example_ep16_v2_std006.json` keeps the same dimensions and scheduling,
+uses `weight_init_std=0.006`, FP32 reference checking and five repetitions of 30
+samples. It is a separate numerical workload: it cannot qualify or replace the
+original scale-0.1 configuration. The scale-0.1 large workload has failed the
+sampled reference tolerance during device validation; retain and investigate that
+failure rather than describing it as accepted.
+A preset alone is not proof of hardware support or measured benefit. Increase warmup, iterations and
 repeats in a configuration copy after verifying correctness and memory requirements.
 No communication-kernel count control is claimed for V2 (`num_sms=0`).
 
@@ -131,13 +136,27 @@ No communication-kernel count control is claimed for V2 (`num_sms=0`).
 Device execution first checks tiny independent float64/autograd mathematics,
 then sampled source-token Y/dX and local expert dW slices, followed by all six
 outputs across layer modes: Y, dX, expert dW1/dW2 and shared-expert dW1/dW2.
-Source samples use FP32 autograd with BF16-valued inputs/weights (rtol 0.06,
-atol 0.002); sampled dW uses rtol 0.04, atol 0.002. Cross-mode defaults are
+Source samples default to FP32 autograd with BF16-valued inputs/weights. Set
+`source_reference_dtype` to `"bf16"` explicitly to check against independent CPU
+autograd with BF16 operator boundaries, including BF16 communication reduction
+outputs before the shared branch is added. Both modes use rtol 0.06, atol 0.002;
+the BF16 mode also records FP32 error diagnostics without claiming FP32 acceptance.
+The selected dtype is part of the workload signature, so baselines from different
+reference modes are not interchangeable. BF16 boundary rounding may differ from
+an all-FP32 graph, especially for near-zero cancellation. No tolerance is changed
+automatically. The SiLU derivative uses the backward of the actual SiLU operator
+to avoid additional BF16 rounding from an expanded sigmoid expression.
+`weight_init_std` specifies the deterministic expert/shared-expert weight scale
+(default 0.1). Input/gradient generation keeps its original scale. Changing this
+field changes the numerical workload and invalidates baseline comparisons; a run
+with another scale does not qualify a failed original configuration. Both the
+selected reference and FP32 diagnostics record sample errors before acceptance.
+Sampled dW uses rtol 0.04, atol 0.002. Cross-mode defaults are
 rtol 0.02, atol 0.002. Sampled reference checks do not prove every distributed
 route against an independent oracle. Failed correctness prevents performance
 aggregation.
 
-NPU events measure A/D windows and the layer from forward dispatch through the
+NPU events measure A/C/D windows and the layer from forward dispatch through the
 final gradient join. Synchronization, rank barriers and gradient zeroing precede
 each timed sample. Layer modes and isolated controls rotate order between repetitions. Reports take the slowest rank for each sample,
 then compute independent repetition means. Benefit is the serial-to-overlap

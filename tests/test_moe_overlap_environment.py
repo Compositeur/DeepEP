@@ -18,10 +18,10 @@ class SoftwareProbeTests(unittest.TestCase):
             def capture(self):
                 pass
 
-            def dispatch(self, previous_event=None, async_finish=False):
+            def dispatch(self, previous_event=None, async_finish=False, allocate_on_comm_stream=False):
                 pass
 
-            def combine(self, previous_event=None, async_finish=False):
+            def combine(self, previous_event=None, async_finish=False, allocate_on_comm_stream=False):
                 pass
 
             def destroy(self):

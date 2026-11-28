@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from .scenarios import WINDOWS, CONTROLS, modes_for_suite, layer_scope
+from .oracle import sampled_reference, reference_errors
 
 
 def fingerprint():
@@ -81,51 +82,6 @@ def fingerprint():
     )
 
 
-def sampled_reference(layer, rank):
-    """Source Y/dX oracle does not use transport handles or received row mappings."""
-    import torch
-
-    c = layer.c
-    p = layer.data
-
-    def weights(e):
-        a = torch.Generator().manual_seed(c.seed + 10000 + e)
-        b = torch.Generator().manual_seed(c.seed + 20000 + e)
-        return (
-            (torch.randn((c.hidden, 2 * c.width), generator=a) * 0.1).bfloat16().float(),
-            (torch.randn((c.width, c.hidden), generator=b) * 0.1).bfloat16().float(),
-        )
-
-    source = []
-    for token in sorted({0, c.tokens // 2, c.tokens - 1}):
-        x = p["x"][token].cpu().float()
-        dy = p["dy"][token].cpu().float()
-        y = torch.zeros(c.hidden)
-        dx = torch.zeros(c.hidden)
-        for e, gate in zip(p["routes"][token].cpu().tolist(), p["gates"][token].cpu().tolist()):
-            w1, w2 = weights(e)
-            # Independent autograd graph, FP32 accumulation with BF16 inputs/weights.
-            xx = x.clone().requires_grad_()
-            pre = xx @ w1
-            left, right = pre.chunk(2)
-            if c.clamp:
-                left, right = left.clamp(-c.clamp, c.clamp), right.clamp(-c.clamp, c.clamp)
-            yy = (torch.nn.functional.silu(left) * right) @ w2 * gate
-            dd = torch.autograd.grad((yy * dy).sum(), xx)[0]
-            y += yy.detach()
-            dx += dd.detach()
-        sw1, sw2 = p["sw1"].cpu().float(), p["sw2"].cpu().float()
-        xx = x.clone().requires_grad_()
-        left, right = (xx @ sw1).chunk(2)
-        if c.clamp:
-            left, right = left.clamp(-c.clamp, c.clamp), right.clamp(-c.clamp, c.clamp)
-        yy = (torch.nn.functional.silu(left) * right) @ sw2
-        dx += torch.autograd.grad((yy * dy).sum(), xx)[0]
-        y += yy.detach()
-        source.append((token, y, dx))
-    return source
-
-
 def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=None):
     import datetime
     import torch
@@ -190,6 +146,7 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=Non
         layer = Layer(c, adapter, rank, npu=True)
         report["cpu_oracle"] = cpu_check(c)
         source = sampled_reference(layer, rank)
+        fp32_source = source if c.source_reference_dtype == "fp32" else sampled_reference(layer, rank, "fp32")
 
         def prepare():
             layer.reset()
@@ -212,6 +169,11 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=Non
                 actual, _ = layer.step(a, d, overlap_c=cached)
                 if precision_reference is None:
                     precision_reference = {k: v.clone() for k, v in actual.items()}
+                    report["source_reference"] = dict(dtype=c.source_reference_dtype, rtol=0.06, atol=0.002)
+                    report["source_reference_diagnostic"] = reference_errors(actual, source)
+                    report["fp32_reference_diagnostic"] = reference_errors(actual, fp32_source)
+                    report["fp32_reference_diagnostic"]["gating"] = c.source_reference_dtype == "fp32"
+                    save()
                     for token, y, dx in source:
                         torch.testing.assert_close(actual["Y"][token].cpu().float(), y, rtol=0.06, atol=0.002)
                         torch.testing.assert_close(actual["dX"][token].cpu().float(), dx, rtol=0.06, atol=0.002)
@@ -280,7 +242,9 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=Non
             report["window_precision_checked"] = window_cases
             report["precision_passed"] = True
             report["precision_scope"] = (
-                "independent tiny CPU autograd; sampled source Y/dX and local dW; all six outputs cross-mode; frozen gates"
+                "independent tiny CPU autograd; sampled source Y/dX using "
+                + c.source_reference_dtype
+                + " operator arithmetic; sampled local dW; all six outputs cross-mode; frozen gates"
             )
             save()
             for rep in range(c.repeats if case in ("all", "layer") else 0):

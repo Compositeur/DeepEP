@@ -89,7 +89,7 @@ class DeepEP:
         ready = self.buffer.capture()
         if self.v1:
             nr, nrdma, ne, mask, event = self.buffer.get_dispatch_layout(
-                routes, self.c.experts, previous_event=ready, async_finish=True
+                routes, self.c.experts, previous_event=ready, async_finish=True, allocate_on_comm_stream=True
             )
             rx, ri, rw, counts, handle, done = self.buffer.dispatch(
                 x,
@@ -102,6 +102,7 @@ class DeepEP:
                 config=self.dc,
                 previous_event=event,
                 async_finish=True,
+                allocate_on_comm_stream=True,
             )
             return rx, Context(handle, counts, ri, rw), done
         rx, _, rw, handle, done = self.buffer.dispatch(
@@ -113,6 +114,7 @@ class DeepEP:
             expert_alignment=1,
             previous_event=ready,
             async_with_compute_stream=True,
+            allocate_on_comm_stream=True,
         )
         return rx, Context(handle, gates=rw), done
 
@@ -138,11 +140,22 @@ class DeepEP:
         ready = self.buffer.capture()
         if self.v1:
             rx, _, _, _, _, done = self.buffer.dispatch(
-                dy, handle=ctx.handle, config=self.dc, previous_event=ready, async_finish=True
+                dy,
+                handle=ctx.handle,
+                config=self.dc,
+                previous_event=ready,
+                async_finish=True,
+                allocate_on_comm_stream=True,
             )
         else:
             rx, _, _, _, done = self.buffer.dispatch(
-                dy, handle=ctx.handle, previous_event=ready, do_cpu_sync=False, async_with_compute_stream=True
+                dy,
+                handle=ctx.handle,
+                previous_event=ready,
+                do_cpu_sync=False,
+                do_expand=True,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=True,
             )
         return rx, done
 
@@ -162,9 +175,13 @@ class DeepEP:
             raise ValueError("Prepare contiguous combine input before capture")
         ready = self.buffer.capture()
         if self.v1:
-            y, _, done = self.buffer.combine(x, ctx.handle, config=self.cc, previous_event=ready, async_finish=True)
+            y, _, done = self.buffer.combine(
+                x, ctx.handle, config=self.cc, previous_event=ready, async_finish=True, allocate_on_comm_stream=True
+            )
         else:
-            y, _, done = self.buffer.combine(x, ctx.handle, previous_event=ready, async_with_compute_stream=True)
+            y, _, done = self.buffer.combine(
+                x, ctx.handle, previous_event=ready, async_with_compute_stream=True, allocate_on_comm_stream=True
+            )
         return y, done
 
     def destroy(self):

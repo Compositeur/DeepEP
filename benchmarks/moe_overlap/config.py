@@ -32,6 +32,8 @@ class Config:
     attention_heads: int = 4
     attention_head_dim: int = 16
     recompute_experts: bool = False
+    source_reference_dtype: str = "fp32"
+    weight_init_std: float = 0.1
 
     def validate(self):
         import math
@@ -56,6 +58,14 @@ class Config:
             raise ValueError("Require EP4/EP16, divisible expert count and valid topk")
         if type(self.recompute_experts) is not bool:
             raise ValueError("recompute_experts must be boolean")
+        if self.source_reference_dtype not in ("fp32", "bf16"):
+            raise ValueError("source_reference_dtype must be fp32 or bf16")
+        if (
+            type(self.weight_init_std) not in (int, float)
+            or not math.isfinite(self.weight_init_std)
+            or self.weight_init_std <= 0
+        ):
+            raise ValueError("weight_init_std must be finite and positive")
         if self.iterations < 2 or self.repeats < 2:
             raise ValueError("At least two iterations and two independent repeats required")
         for k in ("warmup", "profile_iterations"):

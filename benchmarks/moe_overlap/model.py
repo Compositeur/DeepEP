@@ -56,8 +56,9 @@ def activation(pre, limit=0):
 
 def activation_backward(dact, ctx):
     left, right, a, b, limit = ctx
-    sig = torch.sigmoid(a)
-    dl = dact * b * sig * (1 + a * (1 - sig))
+    # Match the backward of the actual SiLU operation. Expanding the derivative
+    # into BF16 sigmoid/multiply/add operations introduces extra rounding steps.
+    dl = torch.ops.aten.silu_backward(dact * b, a)
     dr = dact * torch.nn.functional.silu(a)
     if limit:
         dl = dl * ((left >= -limit) & (left <= limit))
@@ -117,16 +118,20 @@ def attention_replay(x, qkv_weight, out_weight, heads):
 def initialize(c, rank, device, dtype, all_experts=False):
     """Global expert seeds let the source oracle reconstruct remote weights."""
 
-    def rand(shape, seed):
+    def rand(shape, seed, scale=0.1):
         g = torch.Generator().manual_seed(seed)
-        return (torch.randn(shape, generator=g) * 0.1).to(device=device, dtype=dtype)
+        return (torch.randn(shape, generator=g) * scale).to(device=device, dtype=dtype)
 
     n = c.experts if all_experts else c.experts // c.ep
     first = 0 if all_experts else rank * n
-    w1 = torch.stack([rand((c.hidden, 2 * c.width), c.seed + 10000 + e) for e in range(first, first + n)])
-    w2 = torch.stack([rand((c.width, c.hidden), c.seed + 20000 + e) for e in range(first, first + n)])
-    sw1 = rand((c.hidden, 2 * c.shared_width), c.seed + 30000 + rank)
-    sw2 = rand((c.shared_width, c.hidden), c.seed + 40000 + rank)
+    w1 = torch.stack(
+        [rand((c.hidden, 2 * c.width), c.seed + 10000 + e, c.weight_init_std) for e in range(first, first + n)]
+    )
+    w2 = torch.stack(
+        [rand((c.width, c.hidden), c.seed + 20000 + e, c.weight_init_std) for e in range(first, first + n)]
+    )
+    sw1 = rand((c.hidden, 2 * c.shared_width), c.seed + 30000 + rank, c.weight_init_std)
+    sw2 = rand((c.shared_width, c.hidden), c.seed + 40000 + rank, c.weight_init_std)
     x = rand((c.tokens, c.hidden), c.seed + rank)
     dy = rand((c.tokens, c.hidden), c.seed + 1000 + rank)
     g = torch.Generator().manual_seed(c.seed + 2000 + rank)
