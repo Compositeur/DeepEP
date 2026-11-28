@@ -169,6 +169,7 @@ def run(c, out, margin=0, windows=True, baseline=None, case="all", reference=Non
                 actual, _ = layer.step(a, d, overlap_c=cached)
                 if precision_reference is None:
                     precision_reference = {k: v.clone() for k, v in actual.items()}
+                    report["communication_core_counts"] = adapter.core_counts
                     report["source_reference"] = dict(dtype=c.source_reference_dtype, rtol=0.06, atol=0.002)
                     report["source_reference_diagnostic"] = reference_errors(actual, source)
                     report["fp32_reference_diagnostic"] = reference_errors(actual, fp32_source)

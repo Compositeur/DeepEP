@@ -59,6 +59,7 @@ class DeepEP:
         self.c = c
         self.v1 = c.api == "v1_global_clos"
         self.buffer = None
+        self.core_counts = None
         if self.v1:
             # Same public factory and workspace queries as PR 217; no transport override.
             dc, cc = Buffer.get_dispatch_config(c.ep), Buffer.get_combine_config(c.ep)
@@ -115,6 +116,13 @@ class DeepEP:
             previous_event=ready,
             async_with_compute_stream=True,
             allocate_on_comm_stream=True,
+            num_sms=self.c.dispatch_num_sms,
+        )
+        effective_dispatch = handle.num_sms
+        self.core_counts = dict(
+            dispatch=effective_dispatch,
+            combine=self.c.combine_num_sms or effective_dispatch,
+            reduce=self.c.reduce_num_sms or effective_dispatch,
         )
         return rx, Context(handle, gates=rw), done
 
@@ -179,8 +187,18 @@ class DeepEP:
                 x, ctx.handle, config=self.cc, previous_event=ready, async_finish=True, allocate_on_comm_stream=True
             )
         else:
+            options = {}
+            if self.c.combine_num_sms:
+                options["combine_num_sms"] = self.c.combine_num_sms
+            if self.c.reduce_num_sms:
+                options["reduce_num_sms"] = self.c.reduce_num_sms
             y, _, done = self.buffer.combine(
-                x, ctx.handle, previous_event=ready, async_with_compute_stream=True, allocate_on_comm_stream=True
+                x,
+                ctx.handle,
+                previous_event=ready,
+                async_with_compute_stream=True,
+                allocate_on_comm_stream=True,
+                **options,
             )
         return y, done
 

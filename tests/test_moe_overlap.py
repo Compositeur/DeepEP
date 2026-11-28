@@ -322,7 +322,9 @@ class RealDataflowTests(unittest.TestCase):
                 ids = routes[rows, slots]
                 ix = torch.argsort(ids, stable=True)
                 rows, slots = rows[ix], slots[ix]
-                h = types.SimpleNamespace(rows=rows, num_recv_tokens_per_expert_list=[2, 2])
+                h = types.SimpleNamespace(
+                    rows=rows, num_recv_tokens_per_expert_list=[2, 2], num_sms=kw["num_sms"] or 32
+                )
                 return x[rows], None, kw["topk_weights"][rows, slots], h, Event()
 
             def combine(self, x, handle, **kw):

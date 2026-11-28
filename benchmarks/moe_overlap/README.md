@@ -129,7 +129,31 @@ sampled reference tolerance during device validation; retain and investigate tha
 failure rather than describing it as accepted.
 A preset alone is not proof of hardware support or measured benefit. Increase warmup, iterations and
 repeats in a configuration copy after verifying correctness and memory requirements.
-No communication-kernel count control is claimed for V2 (`num_sms=0`).
+For V2, retain legacy `num_sms=0` and set independent `dispatch_num_sms`,
+`combine_num_sms` and `reduce_num_sms`. Zero means the backend default (dispatch)
+or inheritance from the dispatch handle (combine/reduce). Explicit controls require
+V2/UDMA; V1 rejects them. For example, dispatch/combine=16 with reduce=32 keeps
+the reduction launch count unchanged while lowering communication launch counts.
+Cached dispatch inherits its handle's dispatch count. Reports record effective
+counts from the handle; verify native kernel blocks in separate device traces.
+These are communication AIV launch controls, not compute-core reservations.
+For a 16/16/32 experiment, copy a workload configuration and set:
+
+```json
+{
+  "api": "v2_elastic",
+  "num_sms": 0,
+  "dispatch_num_sms": 16,
+  "combine_num_sms": 16,
+  "reduce_num_sms": 32
+}
+```
+
+This fragment must be combined with the original workload fields. Do not replace
+an EP16 configuration with this fragment alone, because omitted fields use defaults.
+Changing counts changes the configuration signature. Establish same-count serial
+and overlap measurements, then compare absolute layer times across configurations;
+do not label a cross-core comparison as the same-mode code regression check.
 
 ## Correctness and timing
 

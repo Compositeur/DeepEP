@@ -81,6 +81,10 @@ def probe(c):
                 "allocate_on_comm_stream",
                 "async_finish" if c.api == "v1_global_clos" else "async_with_compute_stream",
             } <= set(combine)
+            if c.api == "v2_elastic":
+                checks["dispatch_core_control"] = "num_sms" in dispatch
+                if c.combine_num_sms or c.reduce_num_sms:
+                    checks["combine_reduce_core_controls"] = {"combine_num_sms", "reduce_num_sms"} <= set(combine)
         except Exception as exc:
             checks["api_contract"] = False
             result["api_error"] = str(exc)
